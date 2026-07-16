@@ -42,6 +42,8 @@ pub enum LedgerMode {
 
 mod private {
     pub trait Sealed {}
+    pub trait ProductionDepositVerifierSealed {}
+    pub trait ProductionSpendVerifierSealed {}
 }
 
 pub trait LedgerProfile: private::Sealed + Clone + Copy + PartialEq + Eq {
@@ -193,9 +195,13 @@ pub trait DepositProofVerifier {
     fn verify(&self, statement: &DepositStatement, proof: &[u8]) -> Result<()>;
 }
 
-/// Explicit opt-in required by [`ProductionShieldedLedger`]. Implementing this
-/// marker asserts that the verifier is an audited production proof verifier.
-pub trait ProductionDepositProofVerifier: DepositProofVerifier {}
+/// Explicit opt-in required by [`ProductionShieldedLedger`]. The sealed
+/// supertrait prevents a downstream crate from self-attesting an arbitrary
+/// transparent verifier as production zero knowledge.
+pub trait ProductionDepositProofVerifier:
+    DepositProofVerifier + private::ProductionDepositVerifierSealed
+{
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TransparentDepositVerifier;
@@ -244,8 +250,13 @@ impl ClassifiedSpendProofVerifier for TransparentWitnessVerifier {
     const SECURITY: ProofSecurity = ProofSecurity::TransparentDevelopment;
 }
 
-/// Explicit opt-in required by [`ProductionShieldedLedger`].
-pub trait ProductionSpendProofVerifier: ClassifiedSpendProofVerifier {}
+/// Explicit opt-in required by [`ProductionShieldedLedger`]. The sealed
+/// supertrait keeps the production marker owned by this crate until a built-in
+/// verifier and its pinned circuit/parameter registry are present.
+pub trait ProductionSpendProofVerifier:
+    ClassifiedSpendProofVerifier + private::ProductionSpendVerifierSealed
+{
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositReceipt {
@@ -1239,6 +1250,7 @@ mod tests {
         }
     }
 
+    impl private::ProductionDepositVerifierSealed for MisclassifiedProductionDepositVerifier {}
     impl ProductionDepositProofVerifier for MisclassifiedProductionDepositVerifier {}
 
     #[derive(Debug, Clone, Copy)]
@@ -1253,6 +1265,7 @@ mod tests {
         }
     }
 
+    impl private::ProductionDepositVerifierSealed for TestProductionDepositVerifier {}
     impl ProductionDepositProofVerifier for TestProductionDepositVerifier {}
 
     #[derive(Debug, Clone, Copy)]
@@ -1273,6 +1286,7 @@ mod tests {
         const SECURITY: ProofSecurity = ProofSecurity::TransparentDevelopment;
     }
 
+    impl private::ProductionSpendVerifierSealed for MisclassifiedProductionSpendVerifier {}
     impl ProductionSpendProofVerifier for MisclassifiedProductionSpendVerifier {}
 
     #[test]
