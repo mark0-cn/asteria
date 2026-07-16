@@ -21,6 +21,10 @@ pub mod state_sync;
 pub mod store;
 pub mod threshold_dkg;
 pub mod viewing_key;
+#[cfg(feature = "zk-circuit")]
+pub mod zk_batch;
+#[cfg(feature = "zk-circuit")]
+pub mod zk_circuit;
 
 pub use engine::Engine;
 pub use error::{ExchangeError, Result};
