@@ -13,7 +13,8 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::shielded_margin::{
-    Hash, Result, ShieldedMarginError, ViewingKeyEpoch, ViewingKeyResolver,
+    EncryptedViewingPayload, Hash, NoteOpening, PublicNote, Result, ShieldedMarginError,
+    ViewingKeyAad, ViewingKeyEpoch, ViewingKeyResolver, XChaChaViewingKeyCipher,
 };
 
 /// Maximum number of epoch keys retained by one resolver.
@@ -145,6 +146,44 @@ impl DerivedViewingKeyResolver {
         epoch >= self.oldest_retained_epoch() && epoch <= self.current_epoch
     }
 
+    /// Encrypts one canonical note opening with chain, ledger, market, asset,
+    /// commitment, and current key epoch bound into the AEAD context.
+    pub fn seal_note_opening(
+        &self,
+        chain_domain: Hash,
+        ledger_id: Hash,
+        note: PublicNote,
+        opening: &NoteOpening,
+    ) -> Result<EncryptedViewingPayload> {
+        if opening.commitment(note.market_id, note.collateral_asset) != note.commitment {
+            return Err(ShieldedMarginError::CommitmentMismatch);
+        }
+        let aad =
+            ViewingKeyAad::for_note_opening(chain_domain, ledger_id, self.current_epoch, note)?;
+        let plaintext = Zeroizing::new(opening.to_canonical_bytes()?);
+        XChaChaViewingKeyCipher.seal_with_resolver(self, &aad, &plaintext)
+    }
+
+    /// Decrypts and revalidates one note opening using the payload's retained
+    /// historical epoch. A payload that authenticates but opens a different
+    /// commitment is still rejected.
+    pub fn open_note_opening(
+        &self,
+        chain_domain: Hash,
+        ledger_id: Hash,
+        note: PublicNote,
+        payload: &EncryptedViewingPayload,
+    ) -> Result<NoteOpening> {
+        let aad =
+            ViewingKeyAad::for_note_opening(chain_domain, ledger_id, payload.key_epoch, note)?;
+        let plaintext = XChaChaViewingKeyCipher.open_with_resolver(self, &aad, payload)?;
+        let opening = NoteOpening::from_canonical_bytes(&plaintext)?;
+        if opening.commitment(note.market_id, note.collateral_asset) != note.commitment {
+            return Err(ShieldedMarginError::CommitmentMismatch);
+        }
+        Ok(opening)
+    }
+
     /// Advances by one epoch, returning the new current epoch.
     pub fn rotate(&mut self) -> Result<ViewingKeyEpoch> {
         let next = self.current_epoch.next()?;
@@ -222,7 +261,7 @@ fn derive_epoch_key(root: &Hash, epoch: ViewingKeyEpoch) -> Result<Zeroizing<Has
 mod tests {
     use super::*;
     use crate::shielded_margin::{
-        CollateralAssetId, MarketId, NoteCommitment, PublicNote, ViewingKeyAad,
+        CollateralAssetId, MarketId, NoteCommitment, NoteOpening, PublicNote, ViewingKeyAad,
         XChaChaViewingKeyCipher,
     };
     use zeroize::Zeroize;
@@ -368,5 +407,48 @@ mod tests {
                 .seal_with_resolver(&resolver, &new_aad, b"current")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn note_opening_helpers_bind_commitment_and_recover_historical_epochs() {
+        let chain_domain = [31; 32];
+        let ledger_id = [32; 32];
+        let market_id = MarketId::from_label(b"ETH-PERP");
+        let collateral_asset = CollateralAssetId::from_label(b"USDC");
+        let opening = NoteOpening {
+            owner: [33; 32],
+            nullifier_key: [34; 32],
+            collateral: 50_000,
+            position: -7,
+            leverage: 4,
+            blinding: [35; 32],
+        };
+        let note = PublicNote::new(market_id, collateral_asset, &opening);
+        let mut resolver = DerivedViewingKeyResolver::from_root(root(7), 2).unwrap();
+        let payload = resolver
+            .seal_note_opening(chain_domain, ledger_id, note, &opening)
+            .unwrap();
+        resolver.rotate().unwrap();
+        assert_eq!(
+            resolver
+                .open_note_opening(chain_domain, ledger_id, note, &payload)
+                .unwrap(),
+            opening
+        );
+
+        let mut wrong_opening = opening.clone();
+        wrong_opening.collateral += 1;
+        assert_eq!(
+            resolver.seal_note_opening(chain_domain, ledger_id, note, &wrong_opening),
+            Err(ShieldedMarginError::CommitmentMismatch)
+        );
+        let wrong_note = PublicNote {
+            commitment: NoteCommitment([99; 32]),
+            ..note
+        };
+        assert!(matches!(
+            resolver.open_note_opening(chain_domain, ledger_id, wrong_note, &payload),
+            Err(ShieldedMarginError::ViewingCipherAuthentication)
+        ));
     }
 }
