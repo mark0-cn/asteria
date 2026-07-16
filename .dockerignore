@@ -1,0 +1,8 @@
+target
+data
+.tools
+.git
+.env
+*.redb
+asteria-secret-key
+*.key-share

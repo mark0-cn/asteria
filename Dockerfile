@@ -1,0 +1,21 @@
+FROM rust:1.93-bookworm AS build
+WORKDIR /app
+COPY . .
+RUN cargo build --locked --release --bin asteria-abci
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 asteria \
+    && mkdir -p /data \
+    && chown asteria:asteria /data
+COPY --from=build /app/target/release/asteria-abci /usr/local/bin/asteria-abci
+USER asteria
+WORKDIR /home/asteria
+ENV ASTERIA_ABCI_BIND=0.0.0.0:26658
+ENV ASTERIA_HTTP_BIND=0.0.0.0:8080
+ENV ASTERIA_DATA=/data/chain.redb
+VOLUME ["/data"]
+EXPOSE 26658 8080
+ENTRYPOINT ["asteria-abci"]

@@ -1,0 +1,314 @@
+name: asteria-blockchain
+
+x-asteria-app-environment: &asteria-app-environment
+  ASTERIA_ABCI_BIND: "0.0.0.0:26658"
+  ASTERIA_HTTP_BIND: "0.0.0.0:8080"
+  ASTERIA_DATA: "/data/chain.redb"
+  RUST_LOG: "asteria=info,tower_abci=info"
+
+x-asteria-app: &asteria-app
+  image: asteria-abci:local
+  build:
+    context: .
+    dockerfile: deploy/comet/Dockerfile.abci
+  restart: unless-stopped
+  expose:
+    - "26658"
+    - "8080"
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/live"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+    start_period: 10s
+  stop_grace_period: 30s
+
+x-comet: &comet
+  image: cometbft/cometbft:v0.38.23@sha256:fd5d95be05eb47ee478be922e5ff0abce70475643f9a8b929cae9b4fe0474872
+  restart: unless-stopped
+  entrypoint:
+    - /bin/bash
+    - -ec
+  command:
+    - |
+      exec cometbft start \
+        --home=/cometbft \
+        --proxy_app="tcp://$${ABCI_HOST}:26658" \
+        --rpc.laddr="tcp://0.0.0.0:26657"
+  expose:
+    - "26656"
+    - "26657"
+    - "26660"
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - >-
+        curl -fsS http://127.0.0.1:26657/status |
+        jq -e '(.result.sync_info.latest_block_height | tonumber) >= 1 and
+        .result.sync_info.catching_up == false' >/dev/null &&
+        curl -fsS http://127.0.0.1:26657/net_info |
+        jq -e '(.result.n_peers | tonumber) == 3' >/dev/null &&
+        curl -fsS 'http://127.0.0.1:26657/validators?per_page=100' |
+        jq -e '(.result.total | tonumber) == 4 and (.result.validators | length) == 4' >/dev/null &&
+        curl -fsS "http://$${ABCI_HOST}:8080/health" |
+        jq -e '.ready == true' >/dev/null
+    interval: 5s
+    timeout: 3s
+    retries: 30
+    start_period: 15s
+  stop_grace_period: 30s
+  ulimits:
+    nofile:
+      soft: 8192
+      hard: 8192
+
+services:
+  private-keygen:
+    image: asteria-abci:local
+    build:
+      context: .
+      dockerfile: deploy/comet/Dockerfile.abci
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    environment:
+      ASTERIA_CHAIN_ID: "${ASTERIA_CHAIN_ID:-asteria-localnet-1}"
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        install -d -o 10001 -g 10001 -m 0700 \
+          /public /shares/node0 /shares/node1 /shares/node2 /shares/node3
+        stage=/tmp/private-order-keys
+        if [ -f /public/public-key-set.json ]; then
+          test -f /public/dkg-session.json
+          install -d -o 10001 -g 10001 -m 0700 "$${stage}"
+          install -o 10001 -g 10001 -m 0644 /public/public-key-set.json /public/dkg-session.json "$${stage}/"
+          for node in 0 1 2 3; do
+            test -f "/shares/node$${node}/key-share"
+            install -o 10001 -g 10001 -m 0600 "/shares/node$${node}/key-share" "$${stage}/node$${node}.key-share"
+          done
+          exec gosu 10001:10001 /usr/local/bin/asteria-private-keygen \
+            --output-dir "$${stage}" \
+            --epoch 1 \
+            --chain-id "$${ASTERIA_CHAIN_ID}"
+        fi
+        for node in 0 1 2 3; do
+          test ! -e "/shares/node$${node}/key-share"
+        done
+        gosu 10001:10001 /usr/local/bin/asteria-private-keygen \
+          --output-dir "$${stage}" \
+          --epoch 1 \
+          --chain-id "$${ASTERIA_CHAIN_ID}"
+        install -o 10001 -g 10001 -m 0644 "$${stage}/public-key-set.json" "$${stage}/dkg-session.json" /public/
+        for node in 0 1 2 3; do
+          install -o 10001 -g 10001 -m 0600 "$${stage}/node$${node}.key-share" "/shares/node$${node}/key-share"
+        done
+    volumes:
+      - private-order-public:/public
+      - private-order-share0:/shares/node0
+      - private-order-share1:/shares/node1
+      - private-order-share2:/shares/node2
+      - private-order-share3:/shares/node3
+
+  comet-init:
+    image: cometbft/cometbft:v0.38.23@sha256:fd5d95be05eb47ee478be922e5ff0abce70475643f9a8b929cae9b4fe0474872
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    environment:
+      ASTERIA_CHAIN_ID: "${ASTERIA_CHAIN_ID:-asteria-localnet-1}"
+      ASTERIA_AUTHORITY_ACCOUNT: "${ASTERIA_AUTHORITY_ACCOUNT:-ed25519:8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c}"
+    depends_on:
+      private-keygen:
+        condition: service_completed_successfully
+    entrypoint:
+      - /bin/bash
+      - /opt/asteria/init-testnet.sh
+    volumes:
+      - ./deploy/comet/init-testnet.sh:/opt/asteria/init-testnet.sh:ro
+      - ./deploy/comet/genesis-app-state.json:/opt/asteria/genesis-app-state.json:ro
+      - private-order-public:/private:ro
+      - app0-data:/apps/node0
+      - app1-data:/apps/node1
+      - app2-data:/apps/node2
+      - app3-data:/apps/node3
+      - comet0-data:/nodes/node0
+      - comet1-data:/nodes/node1
+      - comet2-data:/nodes/node2
+      - comet3-data:/nodes/node3
+  app0:
+    <<: *asteria-app
+    environment:
+      <<: *asteria-app-environment
+      ASTERIA_COMET_RPC: "http://comet0:26657"
+      ASTERIA_PRIVATE_VALIDATOR_ID: "1"
+      ASTERIA_PRIVATE_KEY_SHARE_FILE: "/private/key-share"
+    depends_on:
+      comet-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - app0-data:/data
+      - private-order-share0:/private:ro
+    networks:
+      - pair0
+
+  app1:
+    <<: *asteria-app
+    environment:
+      <<: *asteria-app-environment
+      ASTERIA_COMET_RPC: "http://comet1:26657"
+      ASTERIA_PRIVATE_VALIDATOR_ID: "2"
+      ASTERIA_PRIVATE_KEY_SHARE_FILE: "/private/key-share"
+    depends_on:
+      comet-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - app1-data:/data
+      - private-order-share1:/private:ro
+    networks:
+      - pair1
+
+  app2:
+    <<: *asteria-app
+    environment:
+      <<: *asteria-app-environment
+      ASTERIA_COMET_RPC: "http://comet2:26657"
+      ASTERIA_PRIVATE_VALIDATOR_ID: "3"
+      ASTERIA_PRIVATE_KEY_SHARE_FILE: "/private/key-share"
+    depends_on:
+      comet-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8082:8080"
+    volumes:
+      - app2-data:/data
+      - private-order-share2:/private:ro
+    networks:
+      - pair2
+
+  app3:
+    <<: *asteria-app
+    environment:
+      <<: *asteria-app-environment
+      ASTERIA_COMET_RPC: "http://comet3:26657"
+      ASTERIA_PRIVATE_VALIDATOR_ID: "4"
+      ASTERIA_PRIVATE_KEY_SHARE_FILE: "/private/key-share"
+    depends_on:
+      comet-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8083:8080"
+    volumes:
+      - app3-data:/data
+      - private-order-share3:/private:ro
+    networks:
+      - pair3
+
+  comet0:
+    <<: *comet
+    environment:
+      ABCI_HOST: app0
+    depends_on:
+      comet-init:
+        condition: service_completed_successfully
+      app0:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:26656:26656"
+      - "127.0.0.1:26657:26657"
+      - "127.0.0.1:26660:26660"
+    volumes:
+      - comet0-data:/cometbft
+    networks:
+      - pair0
+      - comet-p2p
+
+  comet1:
+    <<: *comet
+    environment:
+      ABCI_HOST: app1
+    depends_on:
+      comet-init:
+        condition: service_completed_successfully
+      app1:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:26756:26656"
+      - "127.0.0.1:26757:26657"
+      - "127.0.0.1:26760:26660"
+    volumes:
+      - comet1-data:/cometbft
+    networks:
+      - pair1
+      - comet-p2p
+
+  comet2:
+    <<: *comet
+    environment:
+      ABCI_HOST: app2
+    depends_on:
+      comet-init:
+        condition: service_completed_successfully
+      app2:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:26856:26656"
+      - "127.0.0.1:26857:26657"
+      - "127.0.0.1:26860:26660"
+    volumes:
+      - comet2-data:/cometbft
+    networks:
+      - pair2
+      - comet-p2p
+
+  comet3:
+    <<: *comet
+    environment:
+      ABCI_HOST: app3
+    depends_on:
+      comet-init:
+        condition: service_completed_successfully
+      app3:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:26956:26656"
+      - "127.0.0.1:26957:26657"
+      - "127.0.0.1:26960:26660"
+    volumes:
+      - comet3-data:/cometbft
+    networks:
+      - pair3
+      - comet-p2p
+
+volumes:
+  app0-data:
+  app1-data:
+  app2-data:
+  app3-data:
+  comet0-data:
+  comet1-data:
+  comet2-data:
+  comet3-data:
+  private-order-public:
+  private-order-share0:
+  private-order-share1:
+  private-order-share2:
+  private-order-share3:
+
+networks:
+  pair0:
+    driver: bridge
+  pair1:
+    driver: bridge
+  pair2:
+    driver: bridge
+  pair3:
+    driver: bridge
+  comet-p2p:
+    driver: bridge
