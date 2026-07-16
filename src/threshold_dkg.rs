@@ -80,7 +80,7 @@ impl DkgSession {
         Ok(session)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.chain_domain == [0; 32] {
             return Err(ThresholdDkgError::ZeroChainDomain);
         }

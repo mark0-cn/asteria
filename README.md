@@ -286,8 +286,10 @@ broadcasting, and restart recovery.
 
 ## Production gaps
 
-- Truly distributed FROST DKG/refresh with authenticated broadcast,
-  confidential peer channels, secure validator provisioning, and HSM integration
+- A transport wire contract now provides signed broadcast and encrypted
+  point-to-point DKG envelopes with ceremony/replay binding; a production
+  deployment still needs socket/RPC quorum orchestration, authenticated peer
+  discovery, secure validator provisioning, and HSM integration
 - Multi-machine deployment, sentry topology, backups, snapshots, and state sync
 - Validator governance, upgrades, evidence handling, and slashing policy
 - Production bridge/finality verification and custody
