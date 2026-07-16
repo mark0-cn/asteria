@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     engine::EngineState,
     error::{ExchangeError, Result},
-    state_commitment::{EntityMutation, compute_state_root, decode_state, state_mutations},
+    state_commitment::{
+        EntityMutation, build_state_tree, compute_state_root, decode_state, state_mutations,
+    },
 };
 
 const ENTITY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_entities_v5");
@@ -143,6 +145,104 @@ impl StateStore {
         {
             let metadata = CommitMetadata {
                 version,
+                state_root: root,
+            };
+            let bytes = canonical_encode(&metadata)?;
+            let mut table = write
+                .open_table(METADATA_TABLE)
+                .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+            table
+                .insert(CURRENT_METADATA_KEY, bytes.as_slice())
+                .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+        Ok(root)
+    }
+
+    /// Atomically replaces every persisted entity and JMT node with a verified
+    /// snapshot state. The replacement starts again at JMT version zero so no
+    /// local pre-sync history can influence the imported application hash.
+    pub fn replace_state(&self, next: &EngineState) -> Result<[u8; 32]> {
+        let (root, tree_update, entities) = build_state_tree(next)?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+
+        {
+            let mut table = write
+                .open_table(ENTITY_TABLE)
+                .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+            let mut old_keys = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|error| ExchangeError::Persistence(error.to_string()))?
+            {
+                let (key, _) =
+                    entry.map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+                old_keys.push(key.value().to_vec());
+            }
+            for key in old_keys {
+                table
+                    .remove(key.as_slice())
+                    .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+            }
+            for entity in entities {
+                let value = entity.value.ok_or_else(|| {
+                    ExchangeError::Persistence(
+                        "full state replacement unexpectedly contained a deletion".into(),
+                    )
+                })?;
+                table
+                    .insert(entity.key.as_slice(), value.as_slice())
+                    .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+            }
+        }
+        {
+            let mut table = write
+                .open_table(JMT_NODE_TABLE)
+                .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+            let mut old_keys = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|error| ExchangeError::Persistence(error.to_string()))?
+            {
+                let (key, _) =
+                    entry.map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+                old_keys.push(key.value().to_vec());
+            }
+            for key in old_keys {
+                table
+                    .remove(key.as_slice())
+                    .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+            }
+        }
+        {
+            let mut table = write
+                .open_table(JMT_VALUE_TABLE)
+                .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+            let mut old_keys = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|error| ExchangeError::Persistence(error.to_string()))?
+            {
+                let (key, _) =
+                    entry.map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+                old_keys.push(key.value().to_vec());
+            }
+            for key in old_keys {
+                table
+                    .remove(key.as_slice())
+                    .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+            }
+        }
+
+        self.write_tree_update(&write, 0, &tree_update)?;
+        {
+            let metadata = CommitMetadata {
+                version: 0,
                 state_root: root,
             };
             let bytes = canonical_encode(&metadata)?;
@@ -498,6 +598,38 @@ mod tests {
                 .account_nonces
                 .contains_key("alice")
         );
+    }
+
+    #[test]
+    fn state_sync_replacement_discards_old_entities_and_restarts_jmt_versioning() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path().join("replace.redb")).unwrap();
+        let mut local = EngineState::genesis("replace-test", default_markets());
+        local.height = 1;
+        local.account_nonces.insert("stale-account".into(), 9);
+        let mut stale = Account::new("stale-account".into());
+        stale.collateral = dec!(250);
+        local.accounts.insert(stale.id.clone(), stale);
+        store.commit_state(None, &local).unwrap();
+
+        let mut imported = EngineState::genesis("replace-test", default_markets());
+        imported.height = 77;
+        imported.block_time_ms = 1_700_000_000_000;
+        imported.account_nonces.insert("restored-account".into(), 3);
+        let root = store.replace_state(&imported).unwrap();
+        assert_eq!(root, compute_state_root(&imported).unwrap());
+
+        let loaded = store.load_state().unwrap().unwrap();
+        assert_eq!(loaded.state, imported);
+        assert_eq!(loaded.app_hash, root);
+        assert_eq!(loaded.version, 0);
+        assert!(!loaded.state.accounts.contains_key("stale-account"));
+
+        let mut next = loaded.state.clone();
+        next.height = 78;
+        let next_root = store.commit_state(Some(&loaded.state), &next).unwrap();
+        assert_eq!(next_root, compute_state_root(&next).unwrap());
+        assert_eq!(store.load_state().unwrap().unwrap().version, 1);
     }
 
     #[test]

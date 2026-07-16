@@ -664,6 +664,25 @@ pub fn compute_state_root(state: &EngineState) -> Result<[u8; 32]> {
     Ok(root.into())
 }
 
+/// Builds a complete version-zero JMT update from an independent in-memory
+/// tree.  State sync uses this when replacing an existing database, so the
+/// replacement never depends on (or accidentally incorporates) stale nodes
+/// from the local chain.
+pub(crate) fn build_state_tree(
+    state: &EngineState,
+) -> Result<([u8; 32], TreeUpdateBatch, Vec<EntityMutation>)> {
+    let memory = MemoryTreeStore::default();
+    let tree = Sha256Jmt::new(&memory);
+    let entities = all_entities(state)?;
+    let values = entities
+        .iter()
+        .map(|entity| (entity.key_hash(), entity.value.clone()));
+    let (root, update) = tree
+        .put_value_set(values, 0)
+        .map_err(|error| ExchangeError::Persistence(error.to_string()))?;
+    Ok((root.into(), update, entities))
+}
+
 #[derive(Default)]
 struct MemoryTreeStore {
     nodes: RefCell<BTreeMap<NodeKey, Node>>,

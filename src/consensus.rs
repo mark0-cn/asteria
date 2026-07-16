@@ -17,7 +17,7 @@ use tendermint::{
     AppHash,
     abci::{
         Code, Event as AbciEvent, EventAttributeIndexExt,
-        request::CheckTxKind,
+        request::{ApplySnapshotChunk, CheckTxKind, LoadSnapshotChunk, OfferSnapshot},
         response::{self, PrepareProposal},
         types::{BlockSignatureInfo, ExecTxResult},
     },
@@ -51,6 +51,7 @@ use crate::{
     },
     shielded_margin::MarginPolicy,
     shielded_protocol::{DevelopmentShieldedLedger, derive_chain_domain},
+    state_sync::{StateSnapshotExport, StateSnapshotImport},
     store::StateStore,
 };
 use zeroize::Zeroizing;
@@ -301,6 +302,13 @@ impl TransactionVerificationCache {
         self.resident_bytes = self.resident_bytes.saturating_sub(entry.bytes_len);
     }
 
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.recency.clear();
+        self.resident_bytes = 0;
+        self.next_access = 0;
+    }
+
     fn allocate_access(&mut self) -> u64 {
         if self.next_access == u64::MAX {
             let hashes = self.recency.values().copied().collect::<Vec<_>>();
@@ -331,6 +339,9 @@ struct ChainRuntime {
     store: StateStore,
     committed: Option<ChainSnapshot>,
     pending: Option<ChainSnapshot>,
+    snapshot_export: Option<StateSnapshotExport>,
+    snapshot_export_previous: Option<StateSnapshotExport>,
+    snapshot_import: Option<StateSnapshotImport>,
     mempool_reservations: BTreeMap<AccountId, MempoolReservation>,
     private_validator: Option<PrivateValidatorConfig>,
     transaction_cache: Mutex<TransactionVerificationCache>,
@@ -361,6 +372,9 @@ impl ChainRuntime {
             store,
             committed,
             pending: None,
+            snapshot_export: None,
+            snapshot_export_previous: None,
+            snapshot_import: None,
             mempool_reservations: BTreeMap::new(),
             private_validator,
             transaction_cache: Mutex::new(TransactionVerificationCache::new(
@@ -378,6 +392,10 @@ impl ChainRuntime {
         let genesis: GenesisState = serde_json::from_slice(&request.app_state_bytes)
             .map_err(|error| ConsensusError::InvalidGenesis(error.to_string()))?;
         let chain_id = request.chain_id;
+        let preserve_snapshot_import = self
+            .snapshot_import
+            .as_ref()
+            .is_some_and(|import| import.chain_id() == chain_id);
         validate_genesis(&genesis, &chain_id)?;
         validate_private_order_consensus(
             &genesis,
@@ -418,6 +436,9 @@ impl ChainRuntime {
                 return Err(ConsensusError::GenesisMismatch);
             }
             self.mempool_reservations.clear();
+            if !preserve_snapshot_import {
+                self.snapshot_import = None;
+            }
             Ok(to_app_hash(app_hash))
         } else {
             let app_hash = self
@@ -426,6 +447,9 @@ impl ChainRuntime {
                 .map_err(|error| ConsensusError::Persistence(error.to_string()))?;
             self.committed = Some(ChainSnapshot { state, app_hash });
             self.mempool_reservations.clear();
+            if !preserve_snapshot_import {
+                self.snapshot_import = None;
+            }
             Ok(to_app_hash(app_hash))
         }
     }
@@ -890,6 +914,193 @@ impl ChainRuntime {
         })
     }
 
+    fn list_snapshots(&mut self) -> Result<response::ListSnapshots, ConsensusError> {
+        let Some(committed) = &self.committed else {
+            return Ok(response::ListSnapshots::default());
+        };
+        // A height-zero genesis state is not useful for state sync. CometBFT
+        // will continue with normal genesis initialization in that case.
+        if committed.state.height == 0 {
+            return Ok(response::ListSnapshots::default());
+        }
+        let rebuild = self.snapshot_export.as_ref().is_none_or(|export| {
+            export.height() != committed.state.height || export.app_hash() != committed.app_hash
+        });
+        if rebuild {
+            let export = StateSnapshotExport::create(&committed.state, committed.app_hash)
+                .map_err(|error| ConsensusError::Persistence(error.to_string()))?;
+            self.snapshot_export_previous = self.snapshot_export.take();
+            self.snapshot_export = Some(export);
+        }
+        let export = self
+            .snapshot_export
+            .as_ref()
+            .expect("snapshot export was created above");
+        Ok(response::ListSnapshots {
+            snapshots: vec![export.descriptor()],
+        })
+    }
+
+    fn offer_snapshot(&mut self, request: OfferSnapshot) -> response::OfferSnapshot {
+        // CometBFT may call InitChain before state sync, but a snapshot must
+        // never replace state after the first block has committed.
+        if self.pending.is_some()
+            || self
+                .committed
+                .as_ref()
+                .is_some_and(|committed| committed.state.height > 0)
+        {
+            self.snapshot_import = None;
+            return response::OfferSnapshot::Abort;
+        }
+        match StateSnapshotImport::from_offer(&request.snapshot, request.app_hash.as_bytes()) {
+            Ok(import) => {
+                if self
+                    .committed
+                    .as_ref()
+                    .is_some_and(|committed| committed.state.chain_id.as_str() != import.chain_id())
+                {
+                    return response::OfferSnapshot::Reject;
+                }
+                // A stalled snapshot can be followed by another offer. No
+                // persistent state has changed, so replacing the importer is
+                // rollback-safe and avoids wedging subsequent offers.
+                self.snapshot_import = Some(import);
+                response::OfferSnapshot::Accept
+            }
+            Err(crate::state_sync::StateSyncError::UnsupportedFormat(_)) => {
+                response::OfferSnapshot::RejectFormat
+            }
+            Err(error) => {
+                tracing::warn!(%error, "rejecting state-sync snapshot offer");
+                response::OfferSnapshot::Reject
+            }
+        }
+    }
+
+    fn load_snapshot_chunk(&self, request: LoadSnapshotChunk) -> response::LoadSnapshotChunk {
+        let load = |export: Option<&StateSnapshotExport>| {
+            export.and_then(|export| {
+                export.load_chunk(request.height.value(), request.format, request.chunk)
+            })
+        };
+        if let Some(chunk) = load(self.snapshot_export.as_ref()) {
+            return response::LoadSnapshotChunk { chunk };
+        }
+        if let Some(chunk) = load(self.snapshot_export_previous.as_ref()) {
+            return response::LoadSnapshotChunk { chunk };
+        }
+        response::LoadSnapshotChunk::default()
+    }
+
+    fn apply_snapshot_chunk(
+        &mut self,
+        request: ApplySnapshotChunk,
+    ) -> response::ApplySnapshotChunk {
+        let Some(import) = self.snapshot_import.as_mut() else {
+            return response::ApplySnapshotChunk {
+                result: response::ApplySnapshotChunkResult::RetrySnapshot,
+                ..Default::default()
+            };
+        };
+        let expected_index = import.expected_index();
+        let index = request.index;
+        let sender = request.sender;
+        let complete = match import.apply_chunk(index, request.chunk) {
+            Ok(complete) => complete,
+            Err(error @ crate::state_sync::StateSyncError::UnexpectedChunk { .. }) => {
+                tracing::warn!(%error, "state-sync snapshot chunk arrived out of order");
+                return response::ApplySnapshotChunk {
+                    result: response::ApplySnapshotChunkResult::Retry,
+                    refetch_chunks: vec![expected_index],
+                    ..Default::default()
+                };
+            }
+            Err(error) => {
+                tracing::warn!(%error, "rejecting invalid state-sync snapshot chunk");
+                return response::ApplySnapshotChunk {
+                    result: response::ApplySnapshotChunkResult::Retry,
+                    refetch_chunks: vec![index],
+                    reject_senders: (!sender.is_empty())
+                        .then_some(vec![sender])
+                        .unwrap_or_default(),
+                };
+            }
+        };
+        if !complete {
+            return response::ApplySnapshotChunk {
+                result: response::ApplySnapshotChunkResult::Accept,
+                ..Default::default()
+            };
+        }
+
+        let state = match import.finalize() {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(%error, "rejecting invalid completed state-sync snapshot");
+                self.snapshot_import = None;
+                return response::ApplySnapshotChunk {
+                    result: response::ApplySnapshotChunkResult::RejectSnapshot,
+                    ..Default::default()
+                };
+            }
+        };
+        let app_hash = match compute_app_hash(&state) {
+            Ok(app_hash) => app_hash,
+            Err(error) => {
+                tracing::error!(%error, "state-sync snapshot hash computation failed");
+                self.snapshot_import = None;
+                return response::ApplySnapshotChunk {
+                    result: response::ApplySnapshotChunkResult::Abort,
+                    ..Default::default()
+                };
+            }
+        };
+        if self.pending.is_some()
+            || self.committed.as_ref().is_some_and(|committed| {
+                committed.state.height > 0 || committed.state.chain_id != state.chain_id
+            })
+        {
+            tracing::error!("state changed while a state-sync snapshot was being downloaded");
+            self.snapshot_import = None;
+            return response::ApplySnapshotChunk {
+                result: response::ApplySnapshotChunkResult::Abort,
+                ..Default::default()
+            };
+        }
+        match self.store.replace_state(&state) {
+            Ok(persisted) if persisted == app_hash => {
+                self.committed = Some(ChainSnapshot { state, app_hash });
+                self.pending = None;
+                self.snapshot_import = None;
+                self.snapshot_export = None;
+                self.snapshot_export_previous = None;
+                self.mempool_reservations.clear();
+                self.transaction_cache.lock().clear();
+                response::ApplySnapshotChunk {
+                    result: response::ApplySnapshotChunkResult::Accept,
+                    ..Default::default()
+                }
+            }
+            Ok(_) => {
+                tracing::error!("state-sync snapshot persistence returned a different app hash");
+                self.snapshot_import = None;
+                response::ApplySnapshotChunk {
+                    result: response::ApplySnapshotChunkResult::Abort,
+                    ..Default::default()
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "state-sync snapshot persistence failed");
+                self.snapshot_import = None;
+                response::ApplySnapshotChunk {
+                    result: response::ApplySnapshotChunkResult::Abort,
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
     fn extend_vote(
         &self,
         request: tendermint::v0_38::abci::request::ExtendVote,
@@ -1158,10 +1369,18 @@ impl Service<Request> for ChainApplication {
                 }
                 Request::Flush => Response::Flush,
                 Request::Echo(_) => Response::Echo(Default::default()),
-                Request::ListSnapshots => Response::ListSnapshots(Default::default()),
-                Request::OfferSnapshot(_) => Response::OfferSnapshot(Default::default()),
-                Request::LoadSnapshotChunk(_) => Response::LoadSnapshotChunk(Default::default()),
-                Request::ApplySnapshotChunk(_) => Response::ApplySnapshotChunk(Default::default()),
+                Request::ListSnapshots => {
+                    Response::ListSnapshots(self.inner.write().list_snapshots()?)
+                }
+                Request::OfferSnapshot(request) => {
+                    Response::OfferSnapshot(self.inner.write().offer_snapshot(request))
+                }
+                Request::LoadSnapshotChunk(request) => {
+                    Response::LoadSnapshotChunk(self.inner.read().load_snapshot_chunk(request))
+                }
+                Request::ApplySnapshotChunk(request) => {
+                    Response::ApplySnapshotChunk(self.inner.write().apply_snapshot_chunk(request))
+                }
             })
         })();
         ready(response)
@@ -1789,6 +2008,318 @@ mod tests {
         assert_eq!(store.commit_state(None, &state).unwrap(), app_hash);
         let runtime = ChainRuntime::open(store, None).unwrap();
         (directory, runtime)
+    }
+
+    #[test]
+    fn state_sync_serves_and_atomically_imports_app_hash_verified_state() {
+        let mut source = EngineState::genesis("state-sync-consensus", default_markets());
+        source.height = 12;
+        let app_hash = compute_app_hash(&source).unwrap();
+        let export = StateSnapshotExport::create(&source, app_hash).unwrap();
+        let descriptor = export.descriptor();
+
+        let source_directory = tempfile::tempdir().unwrap();
+        let source_store = StateStore::open(source_directory.path().join("source.redb")).unwrap();
+        source_store.commit_state(None, &source).unwrap();
+        let mut provider = ChainRuntime::open(source_store, None).unwrap();
+        let listed = provider.list_snapshots().unwrap();
+        assert_eq!(listed.snapshots.len(), 1);
+        assert_eq!(listed.snapshots[0], descriptor);
+        let first_chunk = provider.load_snapshot_chunk(LoadSnapshotChunk {
+            height: descriptor.height,
+            format: descriptor.format,
+            chunk: 0,
+        });
+        assert!(!first_chunk.chunk.is_empty());
+
+        let receiver_directory = tempfile::tempdir().unwrap();
+        let receiver_path = receiver_directory.path().join("receiver.redb");
+        let receiver_store = StateStore::open(&receiver_path).unwrap();
+        let mut receiver = ChainRuntime::open(receiver_store, None).unwrap();
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: descriptor.clone(),
+                app_hash: to_app_hash(app_hash),
+            }),
+            response::OfferSnapshot::Accept
+        );
+
+        for index in 0..descriptor.chunks {
+            let chunk = export
+                .load_chunk(source.height, descriptor.format, index)
+                .unwrap();
+            let applied = receiver.apply_snapshot_chunk(ApplySnapshotChunk {
+                index,
+                chunk,
+                sender: "trusted-state-sync-peer".into(),
+            });
+            assert_eq!(applied.result, response::ApplySnapshotChunkResult::Accept);
+        }
+        assert_eq!(receiver.committed.as_ref().unwrap().state, source);
+        assert_eq!(receiver.committed.as_ref().unwrap().app_hash, app_hash);
+        drop(receiver);
+
+        let reopened = StateStore::open(receiver_path).unwrap();
+        let restored = reopened.load_state().unwrap().unwrap();
+        assert_eq!(restored.state, source);
+        assert_eq!(restored.app_hash, app_hash);
+    }
+
+    #[test]
+    fn state_sync_keeps_a_listed_snapshot_available_across_the_next_commit() {
+        let mut state = EngineState::genesis("state-sync-retention", default_markets());
+        state.height = 1;
+        let (_directory, mut provider) = runtime_with_state(state.clone());
+        let first = provider.list_snapshots().unwrap().snapshots[0].clone();
+        let first_chunk = provider.load_snapshot_chunk(LoadSnapshotChunk {
+            height: first.height,
+            format: first.format,
+            chunk: 0,
+        });
+        assert!(!first_chunk.chunk.is_empty());
+
+        state.height = 2;
+        let next_hash = compute_app_hash(&state).unwrap();
+        provider.pending = Some(ChainSnapshot {
+            state: state.clone(),
+            app_hash: next_hash,
+        });
+        provider.commit().unwrap();
+
+        let old_chunk = provider.load_snapshot_chunk(LoadSnapshotChunk {
+            height: first.height,
+            format: first.format,
+            chunk: 0,
+        });
+        assert_eq!(old_chunk.chunk, first_chunk.chunk);
+
+        let second = provider.list_snapshots().unwrap().snapshots[0].clone();
+        assert_eq!(second.height.value(), state.height);
+        let old_chunk_after_rotation = provider.load_snapshot_chunk(LoadSnapshotChunk {
+            height: first.height,
+            format: first.format,
+            chunk: 0,
+        });
+        assert_eq!(old_chunk_after_rotation.chunk, first_chunk.chunk);
+    }
+
+    #[test]
+    fn state_sync_refetches_a_tampered_chunk_without_mutating_storage() {
+        let mut source = EngineState::genesis("state-sync-tamper", default_markets());
+        source.height = 3;
+        let app_hash = compute_app_hash(&source).unwrap();
+        let export = StateSnapshotExport::create(&source, app_hash).unwrap();
+        let descriptor = export.descriptor();
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path().join("receiver.redb")).unwrap();
+        let mut receiver = ChainRuntime::open(store.clone(), None).unwrap();
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: descriptor.clone(),
+                app_hash: to_app_hash(app_hash),
+            }),
+            response::OfferSnapshot::Accept
+        );
+
+        let valid = export
+            .load_chunk(source.height, descriptor.format, 0)
+            .unwrap();
+        let mut tampered = valid.to_vec();
+        tampered[0] ^= 1;
+        let rejected = receiver.apply_snapshot_chunk(ApplySnapshotChunk {
+            index: 0,
+            chunk: tampered.into(),
+            sender: "malicious-peer".into(),
+        });
+        assert_eq!(rejected.result, response::ApplySnapshotChunkResult::Retry);
+        assert_eq!(rejected.refetch_chunks, vec![0]);
+        assert_eq!(rejected.reject_senders, vec!["malicious-peer"]);
+        assert!(receiver.committed.is_none());
+        assert!(store.load_state().unwrap().is_none());
+
+        let accepted = receiver.apply_snapshot_chunk(ApplySnapshotChunk {
+            index: 0,
+            chunk: valid,
+            sender: "honest-peer".into(),
+        });
+        assert_eq!(accepted.result, response::ApplySnapshotChunkResult::Accept);
+        assert_eq!(receiver.committed.as_ref().unwrap().app_hash, app_hash);
+    }
+
+    #[test]
+    fn state_sync_atomically_replaces_height_zero_genesis() {
+        let genesis = EngineState::genesis("state-sync-genesis", default_markets());
+        let genesis_hash = compute_app_hash(&genesis).unwrap();
+        let (_directory, mut receiver) = runtime_with_state(genesis);
+        let store = receiver.store.clone();
+
+        let mut source = EngineState::genesis("state-sync-genesis", default_markets());
+        source.height = 9;
+        source.block_time_ms = 1_234_567;
+        let app_hash = compute_app_hash(&source).unwrap();
+        let export = StateSnapshotExport::create(&source, app_hash).unwrap();
+        let descriptor = export.descriptor();
+        receiver.snapshot_export = Some(export.clone());
+        receiver.snapshot_export_previous = Some(export.clone());
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: descriptor.clone(),
+                app_hash: to_app_hash(app_hash),
+            }),
+            response::OfferSnapshot::Accept
+        );
+
+        for index in 0..descriptor.chunks {
+            let applied = receiver.apply_snapshot_chunk(ApplySnapshotChunk {
+                index,
+                chunk: export
+                    .load_chunk(source.height, descriptor.format, index)
+                    .unwrap(),
+                sender: "genesis-state-sync-peer".into(),
+            });
+            assert_eq!(applied.result, response::ApplySnapshotChunkResult::Accept);
+        }
+
+        let restored = store.load_state().unwrap().unwrap();
+        assert_eq!(restored.state, source);
+        assert_eq!(restored.app_hash, app_hash);
+        assert_eq!(restored.version, 0);
+        assert_ne!(restored.app_hash, genesis_hash);
+        assert!(receiver.snapshot_export.is_none());
+        assert!(receiver.snapshot_export_previous.is_none());
+    }
+
+    #[test]
+    fn rejected_state_sync_snapshot_preserves_genesis_and_accepts_a_new_offer() {
+        let genesis = EngineState::genesis("state-sync-rollback", default_markets());
+        let genesis_hash = compute_app_hash(&genesis).unwrap();
+        let (_directory, mut receiver) = runtime_with_state(genesis.clone());
+        let store = receiver.store.clone();
+
+        let mut invalid = genesis.clone();
+        invalid.height = 5;
+        invalid.total_credits = dec!(1);
+        assert!(!audit_engine_state(&invalid).healthy);
+        let invalid_hash = compute_app_hash(&invalid).unwrap();
+        let invalid_export = StateSnapshotExport::create(&invalid, invalid_hash).unwrap();
+        let invalid_descriptor = invalid_export.descriptor();
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: invalid_descriptor.clone(),
+                app_hash: to_app_hash(invalid_hash),
+            }),
+            response::OfferSnapshot::Accept
+        );
+        let rejected = receiver.apply_snapshot_chunk(ApplySnapshotChunk {
+            index: 0,
+            chunk: invalid_export
+                .load_chunk(invalid.height, invalid_descriptor.format, 0)
+                .unwrap(),
+            sender: "invalid-state-sync-peer".into(),
+        });
+        assert_eq!(
+            rejected.result,
+            response::ApplySnapshotChunkResult::RejectSnapshot
+        );
+        assert_eq!(receiver.committed.as_ref().unwrap().state, genesis);
+        let persisted = store.load_state().unwrap().unwrap();
+        assert_eq!(persisted.state, genesis);
+        assert_eq!(persisted.app_hash, genesis_hash);
+        assert_eq!(persisted.version, 0);
+
+        let mut valid = genesis.clone();
+        valid.height = 6;
+        let valid_hash = compute_app_hash(&valid).unwrap();
+        let valid_export = StateSnapshotExport::create(&valid, valid_hash).unwrap();
+        let valid_descriptor = valid_export.descriptor();
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: valid_descriptor,
+                app_hash: to_app_hash(valid_hash),
+            }),
+            response::OfferSnapshot::Accept
+        );
+    }
+
+    #[test]
+    fn state_sync_reoffer_replaces_an_in_progress_import() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path().join("receiver.redb")).unwrap();
+        let mut receiver = ChainRuntime::open(store, None).unwrap();
+
+        let mut first = EngineState::genesis("state-sync-reoffer", default_markets());
+        first.height = 2;
+        let first_hash = compute_app_hash(&first).unwrap();
+        let first_export = StateSnapshotExport::create(&first, first_hash).unwrap();
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: first_export.descriptor(),
+                app_hash: to_app_hash(first_hash),
+            }),
+            response::OfferSnapshot::Accept
+        );
+
+        let mut replacement = first;
+        replacement.height = 3;
+        let replacement_hash = compute_app_hash(&replacement).unwrap();
+        let replacement_export =
+            StateSnapshotExport::create(&replacement, replacement_hash).unwrap();
+        let replacement_descriptor = replacement_export.descriptor();
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: replacement_descriptor.clone(),
+                app_hash: to_app_hash(replacement_hash),
+            }),
+            response::OfferSnapshot::Accept
+        );
+        let applied = receiver.apply_snapshot_chunk(ApplySnapshotChunk {
+            index: 0,
+            chunk: replacement_export
+                .load_chunk(replacement.height, replacement_descriptor.format, 0)
+                .unwrap(),
+            sender: "replacement-state-sync-peer".into(),
+        });
+        assert_eq!(applied.result, response::ApplySnapshotChunkResult::Accept);
+        assert_eq!(receiver.committed.as_ref().unwrap().state, replacement);
+    }
+
+    #[test]
+    fn state_sync_rejects_wrong_chain_and_aborts_for_live_state() {
+        let genesis = EngineState::genesis("state-sync-local", default_markets());
+        let (_directory, mut receiver) = runtime_with_state(genesis.clone());
+        let mut foreign = EngineState::genesis("state-sync-foreign", default_markets());
+        foreign.height = 4;
+        let foreign_hash = compute_app_hash(&foreign).unwrap();
+        let foreign_export = StateSnapshotExport::create(&foreign, foreign_hash).unwrap();
+        let foreign_descriptor = foreign_export.descriptor();
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: foreign_descriptor.clone(),
+                app_hash: to_app_hash(foreign_hash),
+            }),
+            response::OfferSnapshot::Reject
+        );
+
+        let mut unsupported = foreign_descriptor;
+        unsupported.format = u32::MAX;
+        assert_eq!(
+            receiver.offer_snapshot(OfferSnapshot {
+                snapshot: unsupported,
+                app_hash: to_app_hash(foreign_hash),
+            }),
+            response::OfferSnapshot::RejectFormat
+        );
+
+        let mut live = genesis;
+        live.height = 1;
+        let (_live_directory, mut live_receiver) = runtime_with_state(live);
+        assert_eq!(
+            live_receiver.offer_snapshot(OfferSnapshot {
+                snapshot: foreign_export.descriptor(),
+                app_hash: to_app_hash(foreign_hash),
+            }),
+            response::OfferSnapshot::Abort
+        );
     }
 
     #[test]

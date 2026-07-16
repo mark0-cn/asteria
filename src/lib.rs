@@ -17,6 +17,7 @@ pub mod private_protocol;
 pub mod shielded_margin;
 pub mod shielded_protocol;
 pub mod state_commitment;
+pub mod state_sync;
 pub mod store;
 pub mod threshold_dkg;
 
