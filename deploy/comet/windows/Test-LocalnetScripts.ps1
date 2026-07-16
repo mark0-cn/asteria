@@ -17,6 +17,24 @@ function Assert-LocalnetTest {
     }
 }
 
+function Assert-PowerShell51Syntax {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+
+    $tokens = $null
+    $parseErrors = $null
+    [void] [System.Management.Automation.Language.Parser]::ParseFile(
+        $Path,
+        [ref] $tokens,
+        [ref] $parseErrors
+    )
+    Assert-LocalnetTest -Condition ($parseErrors.Count -eq 0) -Message (
+        "PowerShell 5.1 parser rejected '$Path': " +
+        (($parseErrors | ForEach-Object { $_.Message }) -join "; ")
+    )
+}
+
 function Start-TestSleeper {
     param(
         [Parameter(Mandatory = $true)][string] $Root,
@@ -67,6 +85,18 @@ try {
     $windowsInitText = Get-Content -LiteralPath (Join-Path $PSScriptRoot "Initialize-Localnet.ps1") -Raw
     $windowsStartText = Get-Content -LiteralPath (Join-Path $PSScriptRoot "Start-Localnet.ps1") -Raw
     $windowsCommonText = Get-Content -LiteralPath (Join-Path $PSScriptRoot "Localnet.Common.ps1") -Raw
+    $backupCommonText = Get-Content -LiteralPath (Join-Path $PSScriptRoot "Localnet.Backup.Common.ps1") -Raw
+    $backupScriptText = Get-Content -LiteralPath (Join-Path $PSScriptRoot "Backup-Localnet.ps1") -Raw
+    $restoreScriptText = Get-Content -LiteralPath (Join-Path $PSScriptRoot "Restore-Localnet.ps1") -Raw
+    foreach ($scriptName in @(
+            "Backup-Localnet.ps1",
+            "Localnet.Backup.Common.ps1",
+            "Restore-Localnet.ps1",
+            "Test-BackupRestore.ps1",
+            "Test-LocalnetScripts.ps1"
+        )) {
+        Assert-PowerShell51Syntax -Path (Join-Path $PSScriptRoot $scriptName)
+    }
     $nodeText = Get-Content -LiteralPath (Join-Path $repositoryRoot "src\node.rs") -Raw
     $consensusText = Get-Content -LiteralPath (Join-Path $repositoryRoot "src\consensus.rs") -Raw
     $engineText = Get-Content -LiteralPath (Join-Path $repositoryRoot "src\engine.rs") -Raw
@@ -97,6 +127,11 @@ try {
     Assert-LocalnetTest -Condition ($windowsInitText -match 'vote_extensions_enable_height') -Message "Windows genesis initialization does not enable vote extensions"
     Assert-LocalnetTest -Condition ($linuxInitText -match 'private_validator_bindings' -and $windowsInitText -match 'private_validator_bindings') -Message "validator address bindings are not provisioned on both platforms"
     Assert-LocalnetTest -Condition ($windowsInitText -match 'Protect-PrivateOrderDirectory -Path \$privateConfigParent' -and $windowsInitText -match '\$keyStagingRoot = Join-Path \$privateConfigParent') -Message "Windows key generation is not staged under a pre-protected parent directory"
+    Assert-LocalnetTest -Condition ($backupCommonText -match 'Assert-LocalnetStoppedForBackup' -and $backupCommonText -match 'Assert-BackupArchiveContent') -Message "localnet backup does not enforce a stopped network and content verification"
+    Assert-LocalnetTest -Condition ($backupCommonText -match 'AsteriaBackupMaxFileBytes' -and $backupCommonText -match 'per-file maximum') -Message "localnet backup does not enforce a per-file expansion limit"
+    Assert-LocalnetTest -Condition ($backupCommonText -match 'IndexOf\(\[char\] 0\)' -and $backupCommonText -match 'ReparsePoint') -Message "localnet backup does not reject unsafe archive paths and reparse points"
+    Assert-LocalnetTest -Condition ($backupScriptText -match 'includes_private_order_shares' -and $backupScriptText -match 'IncludePrivateOrderShares' -and $backupScriptText -match 'IncludeValidatorKeys') -Message "localnet backup does not declare private-key handling"
+    Assert-LocalnetTest -Condition ($restoreScriptText -match 'Expand-VerifiedBackupArchive' -and $restoreScriptText -match 'MaxBytes') -Message "localnet restore does not use staged, bounded extraction"
 
     $atomicPath = Join-Path $testRoot "atomic.json"
     Write-Utf8NoBomAtomic -Path $atomicPath -Content '{"generation":1}'

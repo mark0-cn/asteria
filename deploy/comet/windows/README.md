@@ -94,6 +94,62 @@ Legacy or partial managed state without matching vote-extension, keyset, and
 validator-binding configuration is rebuilt destructively; active recorded
 processes must be stopped first.
 
+## Cold backup and restore
+
+Stop all eight processes before backing up. The backup command rejects active
+or stale PID records, verifies the four genesis files, copies every app and
+CometBFT state file except validator identity keys, and publishes a ZIP only
+after generating an internal per-file SHA-256 manifest. Logs and runtime PID
+records are excluded. Restore rejects traversal, absolute, ADS, device-name,
+and reparse-point paths, and enforces both a 100 GiB total expanded-size limit
+and a 16 GiB per-file limit by default.
+
+```powershell
+powershell -File deploy\comet\windows\Stop-Localnet.ps1
+powershell -File deploy\comet\windows\Backup-Localnet.ps1 `
+  -OutputPath D:\asteria-backups\localnet-2026-07-16.zip
+
+# Verify both the external archive checksum and every internal file hash.
+powershell -File deploy\comet\windows\Restore-Localnet.ps1 `
+  -ArchivePath D:\asteria-backups\localnet-2026-07-16.zip `
+  -ExpectedChainId asteria-localnet-1 -VerifyOnly
+
+# Restore into an empty path. Use -Force only to preserve/replace a stopped
+# existing target; the previous directory remains beside the restored one.
+powershell -File deploy\comet\windows\Restore-Localnet.ps1 `
+  -ArchivePath D:\asteria-backups\localnet-2026-07-16.zip `
+  -LocalnetRoot data\restored-localnet
+```
+
+`Backup-Localnet.ps1` writes `<archive>.sha256`. Restore requires that sidecar
+unless `-ExpectedArchiveSha256` supplies a hash obtained through a trusted
+out-of-band channel. The sidecar and internal manifest detect corruption but
+do **not** authenticate an archive if an attacker can replace them together;
+store the checksum independently or sign it using the operator's established
+release-signing system.
+
+Private threshold shares and Comet validator identity keys are excluded by
+default. A usable restore must recover the **exact four threshold share files
+from the same epoch and DKG ceremony**, plus each node's `node_key.json` and
+`priv_validator_key.json`, from separate secret storage. Running a new DKG
+changes the keyset and will not match genesis; replacing validator keys also
+changes node identity and validator signing continuity. `-IncludeValidatorKeys
+-Force` and `-IncludePrivateOrderShares -Force` are available for explicitly
+approved, encrypted, access-controlled secret backups. An archive containing
+either class of key must never be stored unencrypted. Keep threshold shares
+and validator keys in separate secret stores unless an approved recovery
+procedure requires a combined encrypted archive.
+
+Run the backup regression independently with:
+
+```powershell
+powershell -File deploy\comet\windows\Test-BackupRestore.ps1
+```
+
+`Test-LocalnetScripts.ps1` also parses the backup, restore, and regression
+scripts with the Windows PowerShell 5.1 AST parser so syntax accepted only by
+PowerShell 7 does not reach deployment.
+
 The local generator simulates all four official FROST DKG participants inside
 one offline process. It exercises the same session/epoch and key adaptation as
 the protocol, but it is not a production distributed ceremony: production must
