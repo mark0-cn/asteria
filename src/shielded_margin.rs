@@ -4,18 +4,26 @@
 //! [`TransparentWitnessVerifier`] used by the tests decodes every note opening,
 //! so a validator using it can see the owner, collateral, position, leverage,
 //! and nullifier key. A production integration must replace that verifier with
-//! an audited ZK verifier whose public inputs are [`SpendStatement`], and must
-//! replace [`DeterministicTestViewingCipher`] with authenticated encryption.
-//! The state transition and Merkle/nullifier rules here are intended to be the
-//! public foundation shared by those future implementations.
+//! an audited ZK verifier whose public inputs are [`SpendStatement`]. The
+//! authenticated viewing-key payload below defines a wallet crypto boundary,
+//! but is not wired into wallet storage or the production ledger. The state
+//! transition and Merkle/nullifier rules here are intended to be the public
+//! foundation shared by those future implementations.
 
 use std::{collections::BTreeSet, sync::OnceLock};
 
+use chacha20poly1305::{
+    Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
+};
 use ed25519_dalek::{Signature, VerifyingKey};
+use hkdf::Hkdf;
 use imbl::{OrdMap, OrdSet, Vector};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 pub const SHIELDED_MARGIN_VERSION: u16 = 3;
 pub const MERKLE_DEPTH: usize = 32;
@@ -34,8 +42,21 @@ const SPEND_AUTH_DOMAIN: &[u8] = b"ASTERIA_SHIELDED_SPEND_AUTH_V3\0";
 const MERKLE_LEAF_DOMAIN: &[u8] = b"ASTERIA_SHIELDED_MERKLE_LEAF_V3\0";
 const MERKLE_EMPTY_DOMAIN: &[u8] = b"ASTERIA_SHIELDED_MERKLE_EMPTY_V3\0";
 const MERKLE_NODE_DOMAIN: &[u8] = b"ASTERIA_SHIELDED_MERKLE_NODE_V3\0";
-const VIEW_STREAM_DOMAIN: &[u8] = b"ASTERIA_TEST_VIEW_STREAM_V3\0";
-const VIEW_TAG_DOMAIN: &[u8] = b"ASTERIA_TEST_VIEW_TAG_V3\0";
+const VIEW_TEST_NONCE_DOMAIN: &[u8] = b"ASTERIA_TEST_VIEW_NONCE_V1\0";
+const VIEW_TEST_KDF_DOMAIN: &[u8] = b"ASTERIA_TEST_VIEW_KDF_V1\0";
+const VIEW_AEAD_KDF_DOMAIN: &[u8] = b"ASTERIA_SHIELDED_VIEW_KDF_V1\0";
+const VIEW_AEAD_INFO_DOMAIN: &[u8] = b"ASTERIA_SHIELDED_VIEW_XCHACHA20_V1\0";
+const VIEW_AEAD_AAD_DOMAIN: &[u8] = b"ASTERIA_SHIELDED_VIEW_AAD_V1\0";
+const TEST_VIEWING_PAYLOAD_VERSION: u16 = 0;
+pub const VIEWING_AAD_VERSION: u16 = 1;
+pub const VIEWING_PAYLOAD_VERSION: u16 = 1;
+pub const MAX_VIEWING_PLAINTEXT_BYTES: usize = 4 * 1024;
+pub const VIEWING_NONCE_BYTES: usize = 24;
+pub const VIEWING_AEAD_TAG_BYTES: usize = 16;
+pub const VIEWING_AAD_CANONICAL_BYTES: usize = 2 + 1 + 4 + (5 * 32);
+const VIEWING_PAYLOAD_HEADER_BYTES: usize = 2 + 4 + VIEWING_NONCE_BYTES + 4;
+pub const MAX_VIEWING_CIPHERTEXT_BYTES: usize =
+    MAX_VIEWING_PLAINTEXT_BYTES + VIEWING_AEAD_TAG_BYTES;
 
 pub type Hash = [u8; 32];
 
@@ -175,6 +196,28 @@ pub enum ShieldedMarginError {
     NonCanonicalProof,
     #[error("viewing-key ciphertext authentication failed")]
     ViewingCipherAuthentication,
+    #[error("viewing key must not be all zero")]
+    InvalidViewingKey,
+    #[error("viewing-key randomness is unavailable")]
+    ViewingKeyRandomness,
+    #[error("viewing-key epoch overflow")]
+    ViewingKeyEpochOverflow,
+    #[error("viewing-key epoch {0} is unavailable")]
+    ViewingKeyEpochUnavailable(u32),
+    #[error("viewing-key payload epoch does not match its associated data")]
+    ViewingKeyEpochMismatch,
+    #[error("invalid viewing-key associated data: {0}")]
+    InvalidViewingAssociatedData(&'static str),
+    #[error("invalid viewing-key payload: {0}")]
+    InvalidViewingPayload(&'static str),
+    #[error("unsupported viewing-key associated-data version {actual}; expected {expected}")]
+    UnsupportedViewingAadVersion { actual: u16, expected: u16 },
+    #[error("unsupported viewing-key payload version {actual}; expected {expected}")]
+    UnsupportedViewingPayloadVersion { actual: u16, expected: u16 },
+    #[error("viewing-key plaintext is {actual} bytes; maximum is {maximum}")]
+    ViewingPlaintextTooLarge { actual: usize, maximum: usize },
+    #[error("viewing-key ciphertext is {actual} bytes; maximum is {maximum}")]
+    ViewingCiphertextTooLarge { actual: usize, maximum: usize },
 }
 
 pub type Result<T, E = ShieldedMarginError> = std::result::Result<T, E>;
@@ -1189,10 +1232,283 @@ impl ShieldedMarginState {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct ViewingKeyEpoch(pub u32);
+
+impl ViewingKeyEpoch {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+
+    pub fn next(self) -> Result<Self> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(ShieldedMarginError::ViewingKeyEpochOverflow)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewingKeyPurpose {
+    NoteOpening,
+}
+
+impl ViewingKeyPurpose {
+    const fn code(self) -> u8 {
+        match self {
+            Self::NoteOpening => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self> {
+        match code {
+            1 => Ok(Self::NoteOpening),
+            _ => Err(ShieldedMarginError::InvalidViewingAssociatedData(
+                "unknown purpose",
+            )),
+        }
+    }
+}
+
+/// Authenticated context for one encrypted note opening.
+///
+/// The canonical byte layout is version, purpose, key epoch, chain domain,
+/// ledger id, market id, collateral asset id, and note commitment. Keeping
+/// these fixed-width fields in the AEAD context prevents a ciphertext from
+/// being moved between chains, ledgers, markets, notes, or key epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewingKeyAad {
+    pub version: u16,
+    pub purpose: ViewingKeyPurpose,
+    pub key_epoch: ViewingKeyEpoch,
+    pub chain_domain: Hash,
+    pub ledger_id: Hash,
+    pub market_id: MarketId,
+    pub collateral_asset: CollateralAssetId,
+    pub note_commitment: NoteCommitment,
+}
+
+impl ViewingKeyAad {
+    pub fn for_note_opening(
+        chain_domain: Hash,
+        ledger_id: Hash,
+        key_epoch: ViewingKeyEpoch,
+        note: PublicNote,
+    ) -> Result<Self> {
+        note.validate_basic()?;
+        let aad = Self {
+            version: VIEWING_AAD_VERSION,
+            purpose: ViewingKeyPurpose::NoteOpening,
+            key_epoch,
+            chain_domain,
+            ledger_id,
+            market_id: note.market_id,
+            collateral_asset: note.collateral_asset,
+            note_commitment: note.commitment,
+        };
+        aad.validate()?;
+        Ok(aad)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != VIEWING_AAD_VERSION {
+            return Err(ShieldedMarginError::UnsupportedViewingAadVersion {
+                actual: self.version,
+                expected: VIEWING_AAD_VERSION,
+            });
+        }
+        if self.chain_domain == [0; 32] {
+            return Err(ShieldedMarginError::InvalidViewingAssociatedData(
+                "chain domain must not be zero",
+            ));
+        }
+        if self.ledger_id == [0; 32] {
+            return Err(ShieldedMarginError::InvalidViewingAssociatedData(
+                "ledger id must not be zero",
+            ));
+        }
+        validate_ids(self.market_id, self.collateral_asset)?;
+        if self.note_commitment.0 == [0; 32] {
+            return Err(ShieldedMarginError::ZeroCommitment);
+        }
+        Ok(())
+    }
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut bytes = Vec::with_capacity(VIEWING_AAD_CANONICAL_BYTES);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.push(self.purpose.code());
+        bytes.extend_from_slice(&self.key_epoch.0.to_be_bytes());
+        bytes.extend_from_slice(&self.chain_domain);
+        bytes.extend_from_slice(&self.ledger_id);
+        bytes.extend_from_slice(&self.market_id.0);
+        bytes.extend_from_slice(&self.collateral_asset.0);
+        bytes.extend_from_slice(&self.note_commitment.0);
+        debug_assert_eq!(bytes.len(), VIEWING_AAD_CANONICAL_BYTES);
+        Ok(bytes)
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != VIEWING_AAD_CANONICAL_BYTES {
+            return Err(ShieldedMarginError::InvalidViewingAssociatedData(
+                "wrong canonical length",
+            ));
+        }
+        let version = u16::from_be_bytes(
+            bytes[0..2]
+                .try_into()
+                .expect("viewing AAD version has fixed length"),
+        );
+        let purpose = ViewingKeyPurpose::from_code(bytes[2])?;
+        let key_epoch = ViewingKeyEpoch(u32::from_be_bytes(
+            bytes[3..7]
+                .try_into()
+                .expect("viewing AAD epoch has fixed length"),
+        ));
+        let aad = Self {
+            version,
+            purpose,
+            key_epoch,
+            chain_domain: viewing_hash(&bytes[7..39]),
+            ledger_id: viewing_hash(&bytes[39..71]),
+            market_id: MarketId(viewing_hash(&bytes[71..103])),
+            collateral_asset: CollateralAssetId(viewing_hash(&bytes[103..135])),
+            note_commitment: NoteCommitment(viewing_hash(&bytes[135..167])),
+        };
+        aad.validate()?;
+        Ok(aad)
+    }
+}
+
+/// Versioned XChaCha20-Poly1305 payload. The authentication tag is the final
+/// 16 bytes of `ciphertext`, as defined by the AEAD implementation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedViewingPayload {
+    pub version: u16,
+    pub key_epoch: ViewingKeyEpoch,
+    pub nonce: [u8; VIEWING_NONCE_BYTES],
     pub ciphertext: Vec<u8>,
-    pub tag: Hash,
+}
+
+impl EncryptedViewingPayload {
+    pub fn validate(&self) -> Result<()> {
+        self.validate_for_version(VIEWING_PAYLOAD_VERSION)
+    }
+
+    fn validate_for_version(&self, expected_version: u16) -> Result<()> {
+        if self.version != expected_version {
+            return Err(ShieldedMarginError::UnsupportedViewingPayloadVersion {
+                actual: self.version,
+                expected: expected_version,
+            });
+        }
+        if self.nonce == [0; VIEWING_NONCE_BYTES] {
+            return Err(ShieldedMarginError::InvalidViewingPayload(
+                "nonce must not be zero",
+            ));
+        }
+        if self.ciphertext.len() < VIEWING_AEAD_TAG_BYTES {
+            return Err(ShieldedMarginError::InvalidViewingPayload(
+                "ciphertext is shorter than the authentication tag",
+            ));
+        }
+        if self.ciphertext.len() > MAX_VIEWING_CIPHERTEXT_BYTES {
+            return Err(ShieldedMarginError::ViewingCiphertextTooLarge {
+                actual: self.ciphertext.len(),
+                maximum: MAX_VIEWING_CIPHERTEXT_BYTES,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let ciphertext_len = u32::try_from(self.ciphertext.len()).map_err(|_| {
+            ShieldedMarginError::ViewingCiphertextTooLarge {
+                actual: self.ciphertext.len(),
+                maximum: MAX_VIEWING_CIPHERTEXT_BYTES,
+            }
+        })?;
+        let mut bytes = Vec::with_capacity(VIEWING_PAYLOAD_HEADER_BYTES + self.ciphertext.len());
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.key_epoch.0.to_be_bytes());
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&ciphertext_len.to_be_bytes());
+        bytes.extend_from_slice(&self.ciphertext);
+        Ok(bytes)
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < VIEWING_PAYLOAD_HEADER_BYTES {
+            return Err(ShieldedMarginError::InvalidViewingPayload(
+                "canonical payload is truncated",
+            ));
+        }
+        let version = u16::from_be_bytes(
+            bytes[0..2]
+                .try_into()
+                .expect("viewing payload version has fixed length"),
+        );
+        let key_epoch = ViewingKeyEpoch(u32::from_be_bytes(
+            bytes[2..6]
+                .try_into()
+                .expect("viewing payload epoch has fixed length"),
+        ));
+        let mut nonce = [0_u8; VIEWING_NONCE_BYTES];
+        nonce.copy_from_slice(&bytes[6..6 + VIEWING_NONCE_BYTES]);
+        let length_offset = 6 + VIEWING_NONCE_BYTES;
+        let ciphertext_len = usize::try_from(u32::from_be_bytes(
+            bytes[length_offset..length_offset + 4]
+                .try_into()
+                .expect("viewing payload length has fixed length"),
+        ))
+        .expect("u32 ciphertext length fits usize");
+        if ciphertext_len > MAX_VIEWING_CIPHERTEXT_BYTES {
+            return Err(ShieldedMarginError::ViewingCiphertextTooLarge {
+                actual: ciphertext_len,
+                maximum: MAX_VIEWING_CIPHERTEXT_BYTES,
+            });
+        }
+        let expected_len = VIEWING_PAYLOAD_HEADER_BYTES
+            .checked_add(ciphertext_len)
+            .ok_or(ShieldedMarginError::InvalidViewingPayload(
+                "canonical payload length overflow",
+            ))?;
+        if bytes.len() != expected_len {
+            return Err(ShieldedMarginError::InvalidViewingPayload(
+                "canonical payload length does not match its header",
+            ));
+        }
+        let payload = Self {
+            version,
+            key_epoch,
+            nonce,
+            ciphertext: bytes[VIEWING_PAYLOAD_HEADER_BYTES..].to_vec(),
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+}
+
+pub type AuthenticatedViewingPayload = EncryptedViewingPayload;
+
+/// Wallet/key-custody boundary for rotation and historical recovery. Returned
+/// key bytes are zeroized on drop; implementations decide how epochs are
+/// stored, backed up, recovered, and access-controlled.
+pub trait ViewingKeyResolver {
+    fn current_epoch(&self) -> Result<ViewingKeyEpoch>;
+    fn key_for_epoch(&self, epoch: ViewingKeyEpoch) -> Result<Zeroizing<Hash>>;
 }
 
 /// Interface for encrypting note openings to a wallet viewing key.
@@ -1200,22 +1516,21 @@ pub trait ViewingKeyEncryption {
     fn seal(
         &self,
         viewing_key: &Hash,
-        associated_data: &[u8],
+        aad: &ViewingKeyAad,
         plaintext: &[u8],
     ) -> Result<EncryptedViewingPayload>;
 
     fn open(
         &self,
         viewing_key: &Hash,
-        associated_data: &[u8],
+        aad: &ViewingKeyAad,
         payload: &EncryptedViewingPayload,
-    ) -> Result<Vec<u8>>;
+    ) -> Result<Zeroizing<Vec<u8>>>;
 }
 
-/// Deterministic XOR stream and hash tag for reproducible tests only.
-///
-/// This is not semantically secure, is not a standard AEAD construction, and
-/// must never protect real notes.
+/// Deterministic XChaCha adapter for reproducible tests only. Its nonce is
+/// derived from secret and plaintext data, so repeated messages repeat nonces.
+/// It must never protect wallet data.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeterministicTestViewingCipher;
 
@@ -1223,36 +1538,261 @@ impl ViewingKeyEncryption for DeterministicTestViewingCipher {
     fn seal(
         &self,
         viewing_key: &Hash,
-        associated_data: &[u8],
+        aad: &ViewingKeyAad,
         plaintext: &[u8],
     ) -> Result<EncryptedViewingPayload> {
-        let ciphertext = xor_test_stream(viewing_key, associated_data, plaintext);
-        let tag = hash_parts(
-            VIEW_TAG_DOMAIN,
-            &[viewing_key, associated_data, &ciphertext],
+        validate_viewing_plaintext_size(plaintext)?;
+        let aad_bytes = aad.to_canonical_bytes()?;
+        let digest = hash_parts(
+            VIEW_TEST_NONCE_DOMAIN,
+            &[viewing_key, &aad_bytes, plaintext],
         );
-        Ok(EncryptedViewingPayload { ciphertext, tag })
+        let mut nonce = [0_u8; VIEWING_NONCE_BYTES];
+        nonce.copy_from_slice(&digest[..VIEWING_NONCE_BYTES]);
+        if nonce == [0; VIEWING_NONCE_BYTES] {
+            nonce[VIEWING_NONCE_BYTES - 1] = 1;
+        }
+        seal_viewing_payload(
+            TEST_VIEWING_PAYLOAD_VERSION,
+            VIEW_TEST_KDF_DOMAIN,
+            viewing_key,
+            aad,
+            nonce,
+            plaintext,
+        )
     }
 
     fn open(
         &self,
         viewing_key: &Hash,
-        associated_data: &[u8],
+        aad: &ViewingKeyAad,
         payload: &EncryptedViewingPayload,
-    ) -> Result<Vec<u8>> {
-        let expected_tag = hash_parts(
-            VIEW_TAG_DOMAIN,
-            &[viewing_key, associated_data, &payload.ciphertext],
-        );
-        if !bool::from(expected_tag.ct_eq(&payload.tag)) {
-            return Err(ShieldedMarginError::ViewingCipherAuthentication);
-        }
-        Ok(xor_test_stream(
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        open_viewing_payload(
+            TEST_VIEWING_PAYLOAD_VERSION,
+            VIEW_TEST_KDF_DOMAIN,
             viewing_key,
-            associated_data,
-            &payload.ciphertext,
-        ))
+            aad,
+            payload,
+        )
     }
+}
+
+/// XChaCha20-Poly1305 primitive for wallet viewing-key payloads. This does not
+/// provide wallet storage, custody, recovery, or ledger integration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XChaChaViewingKeyCipher;
+
+impl XChaChaViewingKeyCipher {
+    /// Encrypt one payload using an already-resolved epoch key.
+    pub fn seal(
+        &self,
+        viewing_key: &Hash,
+        aad: &ViewingKeyAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedViewingPayload> {
+        <Self as ViewingKeyEncryption>::seal(self, viewing_key, aad, plaintext)
+    }
+
+    /// Decrypt one payload using an already-resolved epoch key.
+    pub fn open(
+        &self,
+        viewing_key: &Hash,
+        aad: &ViewingKeyAad,
+        payload: &EncryptedViewingPayload,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        <Self as ViewingKeyEncryption>::open(self, viewing_key, aad, payload)
+    }
+
+    pub fn seal_with_resolver<R: ViewingKeyResolver>(
+        &self,
+        resolver: &R,
+        aad: &ViewingKeyAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedViewingPayload> {
+        if resolver.current_epoch()? != aad.key_epoch {
+            return Err(ShieldedMarginError::ViewingKeyEpochMismatch);
+        }
+        let key = resolver.key_for_epoch(aad.key_epoch)?;
+        ViewingKeyEncryption::seal(self, &key, aad, plaintext)
+    }
+
+    pub fn open_with_resolver<R: ViewingKeyResolver>(
+        &self,
+        resolver: &R,
+        aad: &ViewingKeyAad,
+        payload: &EncryptedViewingPayload,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        if payload.key_epoch != aad.key_epoch {
+            return Err(ShieldedMarginError::ViewingKeyEpochMismatch);
+        }
+        let key = resolver.key_for_epoch(payload.key_epoch)?;
+        ViewingKeyEncryption::open(self, &key, aad, payload)
+    }
+}
+
+impl ViewingKeyEncryption for XChaChaViewingKeyCipher {
+    fn seal(
+        &self,
+        viewing_key: &Hash,
+        aad: &ViewingKeyAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedViewingPayload> {
+        validate_viewing_plaintext_size(plaintext)?;
+        let mut nonce = [0_u8; VIEWING_NONCE_BYTES];
+        OsRng
+            .try_fill_bytes(&mut nonce)
+            .map_err(|_| ShieldedMarginError::ViewingKeyRandomness)?;
+        if nonce == [0; VIEWING_NONCE_BYTES] {
+            return Err(ShieldedMarginError::ViewingKeyRandomness);
+        }
+        seal_viewing_payload(
+            VIEWING_PAYLOAD_VERSION,
+            VIEW_AEAD_KDF_DOMAIN,
+            viewing_key,
+            aad,
+            nonce,
+            plaintext,
+        )
+    }
+
+    fn open(
+        &self,
+        viewing_key: &Hash,
+        aad: &ViewingKeyAad,
+        payload: &EncryptedViewingPayload,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        open_viewing_payload(
+            VIEWING_PAYLOAD_VERSION,
+            VIEW_AEAD_KDF_DOMAIN,
+            viewing_key,
+            aad,
+            payload,
+        )
+    }
+}
+
+fn seal_viewing_payload(
+    version: u16,
+    kdf_domain: &[u8],
+    viewing_key: &Hash,
+    aad: &ViewingKeyAad,
+    nonce: [u8; VIEWING_NONCE_BYTES],
+    plaintext: &[u8],
+) -> Result<EncryptedViewingPayload> {
+    aad.validate()?;
+    validate_viewing_plaintext_size(plaintext)?;
+    let key = viewing_aead_key(version, kdf_domain, viewing_key, aad)?;
+    let associated_data = viewing_aead_associated_data(version, aad)?;
+    let ciphertext = {
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
+        cipher.encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &associated_data,
+            },
+        )
+    }
+    .map_err(|_| ShieldedMarginError::ViewingCipherAuthentication)?;
+    let payload = EncryptedViewingPayload {
+        version,
+        key_epoch: aad.key_epoch,
+        nonce,
+        ciphertext,
+    };
+    payload.validate_for_version(version)?;
+    Ok(payload)
+}
+
+fn open_viewing_payload(
+    version: u16,
+    kdf_domain: &[u8],
+    viewing_key: &Hash,
+    aad: &ViewingKeyAad,
+    payload: &EncryptedViewingPayload,
+) -> Result<Zeroizing<Vec<u8>>> {
+    aad.validate()?;
+    payload.validate_for_version(version)?;
+    if payload.key_epoch != aad.key_epoch {
+        return Err(ShieldedMarginError::ViewingKeyEpochMismatch);
+    }
+    let key = viewing_aead_key(version, kdf_domain, viewing_key, aad)?;
+    let associated_data = viewing_aead_associated_data(version, aad)?;
+    let plaintext = {
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
+        cipher.decrypt(
+            XNonce::from_slice(&payload.nonce),
+            Payload {
+                msg: &payload.ciphertext,
+                aad: &associated_data,
+            },
+        )
+    }
+    .map_err(|_| ShieldedMarginError::ViewingCipherAuthentication)?;
+    if plaintext.len() > MAX_VIEWING_PLAINTEXT_BYTES {
+        return Err(ShieldedMarginError::ViewingPlaintextTooLarge {
+            actual: plaintext.len(),
+            maximum: MAX_VIEWING_PLAINTEXT_BYTES,
+        });
+    }
+    Ok(Zeroizing::new(plaintext))
+}
+
+fn viewing_aead_key(
+    version: u16,
+    kdf_domain: &[u8],
+    viewing_key: &Hash,
+    aad: &ViewingKeyAad,
+) -> Result<Zeroizing<Hash>> {
+    if bool::from(viewing_key.ct_eq(&[0; 32])) {
+        return Err(ShieldedMarginError::InvalidViewingKey);
+    }
+    let aad_bytes = aad.to_canonical_bytes()?;
+    let mut info = Vec::with_capacity(VIEW_AEAD_INFO_DOMAIN.len() + 2 + 4 + aad_bytes.len());
+    info.extend_from_slice(VIEW_AEAD_INFO_DOMAIN);
+    info.extend_from_slice(&version.to_be_bytes());
+    info.extend_from_slice(
+        &u32::try_from(aad_bytes.len())
+            .expect("fixed viewing AAD length fits u32")
+            .to_be_bytes(),
+    );
+    info.extend_from_slice(&aad_bytes);
+    let hkdf = Hkdf::<Sha256>::new(Some(kdf_domain), viewing_key);
+    let mut key = Zeroizing::new([0_u8; 32]);
+    hkdf.expand(&info, &mut key[..])
+        .map_err(|_| ShieldedMarginError::ViewingCipherAuthentication)?;
+    Ok(key)
+}
+
+fn viewing_aead_associated_data(version: u16, aad: &ViewingKeyAad) -> Result<Vec<u8>> {
+    let aad_bytes = aad.to_canonical_bytes()?;
+    let mut bytes = Vec::with_capacity(VIEW_AEAD_AAD_DOMAIN.len() + 2 + 4 + aad_bytes.len());
+    bytes.extend_from_slice(VIEW_AEAD_AAD_DOMAIN);
+    bytes.extend_from_slice(&version.to_be_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(aad_bytes.len())
+            .expect("fixed viewing AAD length fits u32")
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(&aad_bytes);
+    Ok(bytes)
+}
+
+fn validate_viewing_plaintext_size(plaintext: &[u8]) -> Result<()> {
+    if plaintext.len() > MAX_VIEWING_PLAINTEXT_BYTES {
+        return Err(ShieldedMarginError::ViewingPlaintextTooLarge {
+            actual: plaintext.len(),
+            maximum: MAX_VIEWING_PLAINTEXT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn viewing_hash(bytes: &[u8]) -> Hash {
+    bytes
+        .try_into()
+        .expect("viewing-key canonical hash field has fixed length")
 }
 
 fn validate_version(version: u16) -> Result<()> {
@@ -1378,22 +1918,12 @@ fn merkle_root<'a>(leaves: impl Iterator<Item = &'a PublicNote>) -> Hash {
     level[0]
 }
 
-fn xor_test_stream(viewing_key: &Hash, associated_data: &[u8], input: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(input.len());
-    for (counter, chunk) in input.chunks(32).enumerate() {
-        let counter = u64::try_from(counter).expect("allocated input has a u64 chunk count");
-        let block = hash_parts(
-            VIEW_STREAM_DOMAIN,
-            &[viewing_key, associated_data, &counter.to_be_bytes()],
-        );
-        output.extend(chunk.iter().zip(block).map(|(byte, mask)| byte ^ mask));
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use ed25519_dalek::{Signer as _, SigningKey};
+    use zeroize::Zeroize;
 
     use super::*;
 
@@ -1923,31 +2453,275 @@ mod tests {
         );
     }
 
+    fn viewing_aad(opening: &NoteOpening, epoch: u32) -> ViewingKeyAad {
+        let note = PublicNote::new(market_id(), asset_id(), opening);
+        ViewingKeyAad::for_note_opening([7; 32], [8; 32], ViewingKeyEpoch::new(epoch), note)
+            .unwrap()
+    }
+
     #[test]
-    fn deterministic_viewing_cipher_round_trips_and_authenticates() {
+    fn viewing_aad_and_payload_have_strict_canonical_binary_encodings() {
+        let signing_key = SigningKey::from_bytes(&[30; 32]);
+        let opening = opening(&signing_key, 13, 1_000, -20, 5);
+        let aad = viewing_aad(&opening, 4);
+        let aad_bytes = aad.to_canonical_bytes().unwrap();
+        assert_eq!(aad_bytes.len(), VIEWING_AAD_CANONICAL_BYTES);
+        assert_eq!(
+            ViewingKeyAad::from_canonical_bytes(&aad_bytes).unwrap(),
+            aad
+        );
+        let mut wrong_aad_version = aad_bytes.clone();
+        wrong_aad_version[1] = 2;
+        assert_eq!(
+            ViewingKeyAad::from_canonical_bytes(&wrong_aad_version),
+            Err(ShieldedMarginError::UnsupportedViewingAadVersion {
+                actual: 2,
+                expected: VIEWING_AAD_VERSION,
+            })
+        );
+        let mut zero_chain = aad_bytes.clone();
+        zero_chain[7..39].fill(0);
+        assert_eq!(
+            ViewingKeyAad::from_canonical_bytes(&zero_chain),
+            Err(ShieldedMarginError::InvalidViewingAssociatedData(
+                "chain domain must not be zero"
+            ))
+        );
+        assert_eq!(
+            ViewingKeyAad::from_canonical_bytes(&aad_bytes[..aad_bytes.len() - 1]),
+            Err(ShieldedMarginError::InvalidViewingAssociatedData(
+                "wrong canonical length"
+            ))
+        );
+
+        let plaintext = opening.to_canonical_bytes().unwrap();
+        let payload = XChaChaViewingKeyCipher
+            .seal(&[41; 32], &aad, &plaintext)
+            .unwrap();
+        let payload_bytes = payload.to_canonical_bytes().unwrap();
+        assert_eq!(
+            EncryptedViewingPayload::from_canonical_bytes(&payload_bytes).unwrap(),
+            payload
+        );
+        let mut trailing = payload_bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            EncryptedViewingPayload::from_canonical_bytes(&trailing),
+            Err(ShieldedMarginError::InvalidViewingPayload(
+                "canonical payload length does not match its header"
+            ))
+        );
+        let mut wrong_version = payload_bytes;
+        wrong_version[1] = 2;
+        assert_eq!(
+            EncryptedViewingPayload::from_canonical_bytes(&wrong_version),
+            Err(ShieldedMarginError::UnsupportedViewingPayloadVersion {
+                actual: 2,
+                expected: VIEWING_PAYLOAD_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn deterministic_test_cipher_is_authenticated_but_not_production_format() {
         let signing_key = SigningKey::from_bytes(&[31; 32]);
         let opening = opening(&signing_key, 13, 1_000, -20, 5);
         let plaintext = opening.to_canonical_bytes().unwrap();
+        let aad = viewing_aad(&opening, 0);
         let viewing_key = [41; 32];
-        let associated_data =
-            PublicNote::new(market_id(), asset_id(), &opening).to_canonical_bytes();
         let cipher = DeterministicTestViewingCipher;
-        let payload = cipher
-            .seal(&viewing_key, &associated_data, &plaintext)
-            .unwrap();
-        let decrypted = cipher
-            .open(&viewing_key, &associated_data, &payload)
-            .unwrap();
+        let first = cipher.seal(&viewing_key, &aad, &plaintext).unwrap();
+        let second = cipher.seal(&viewing_key, &aad, &plaintext).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.version, TEST_VIEWING_PAYLOAD_VERSION);
         assert_eq!(
-            NoteOpening::from_canonical_bytes(&decrypted).unwrap(),
+            NoteOpening::from_canonical_bytes(&cipher.open(&viewing_key, &aad, &first).unwrap())
+                .unwrap(),
             opening
         );
 
-        let mut tampered = payload;
+        let mut tampered = first;
         tampered.ciphertext[0] ^= 1;
         assert_eq!(
-            cipher.open(&viewing_key, &associated_data, &tampered),
+            cipher.open(&viewing_key, &aad, &tampered),
             Err(ShieldedMarginError::ViewingCipherAuthentication)
+        );
+    }
+
+    #[test]
+    fn xchacha_viewing_cipher_is_randomized_and_binds_wallet_context() {
+        let signing_key = SigningKey::from_bytes(&[32; 32]);
+        let opening = opening(&signing_key, 14, 2_000, 25, 4);
+        let plaintext = opening.to_canonical_bytes().unwrap();
+        let aad = viewing_aad(&opening, 1);
+        let viewing_key = [42; 32];
+        let cipher = XChaChaViewingKeyCipher;
+        let first = cipher.seal(&viewing_key, &aad, &plaintext).unwrap();
+        let second = cipher.seal(&viewing_key, &aad, &plaintext).unwrap();
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first.ciphertext, second.ciphertext);
+        assert_eq!(
+            &*cipher.open(&viewing_key, &aad, &first).unwrap(),
+            plaintext.as_slice()
+        );
+
+        let mut wrong_context = aad;
+        wrong_context.ledger_id[0] ^= 1;
+        assert_eq!(
+            cipher.open(&viewing_key, &wrong_context, &first),
+            Err(ShieldedMarginError::ViewingCipherAuthentication)
+        );
+        let mut tampered_epoch = first.clone();
+        tampered_epoch.key_epoch = ViewingKeyEpoch::new(2);
+        assert_eq!(
+            cipher.open(&viewing_key, &aad, &tampered_epoch),
+            Err(ShieldedMarginError::ViewingKeyEpochMismatch)
+        );
+        let mut tampered_nonce = first.clone();
+        tampered_nonce.nonce[0] ^= 1;
+        assert_eq!(
+            cipher.open(&viewing_key, &aad, &tampered_nonce),
+            Err(ShieldedMarginError::ViewingCipherAuthentication)
+        );
+        let mut tampered_ciphertext = first;
+        tampered_ciphertext.ciphertext[0] ^= 1;
+        assert_eq!(
+            cipher.open(&viewing_key, &aad, &tampered_ciphertext),
+            Err(ShieldedMarginError::ViewingCipherAuthentication)
+        );
+        assert_eq!(
+            cipher.open(&[0; 32], &aad, &tampered_ciphertext),
+            Err(ShieldedMarginError::InvalidViewingKey)
+        );
+    }
+
+    #[test]
+    fn viewing_cipher_enforces_bounds_and_zeroizes_decrypted_material() {
+        let signing_key = SigningKey::from_bytes(&[34; 32]);
+        let opening = opening(&signing_key, 15, 2_000, 25, 4);
+        let aad = viewing_aad(&opening, 1);
+        let cipher = XChaChaViewingKeyCipher;
+        let maximum = vec![7_u8; MAX_VIEWING_PLAINTEXT_BYTES];
+        let payload = cipher.seal(&[43; 32], &aad, &maximum).unwrap();
+        let mut opened = cipher.open(&[43; 32], &aad, &payload).unwrap();
+        assert_eq!(&*opened, maximum.as_slice());
+        opened.zeroize();
+        assert!(opened.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            cipher.seal(
+                &[43; 32],
+                &aad,
+                &vec![0_u8; MAX_VIEWING_PLAINTEXT_BYTES + 1]
+            ),
+            Err(ShieldedMarginError::ViewingPlaintextTooLarge {
+                actual: MAX_VIEWING_PLAINTEXT_BYTES + 1,
+                maximum: MAX_VIEWING_PLAINTEXT_BYTES,
+            })
+        );
+
+        let mut oversized = payload;
+        oversized.ciphertext.push(0);
+        assert_eq!(
+            cipher.open(&[43; 32], &aad, &oversized),
+            Err(ShieldedMarginError::ViewingCiphertextTooLarge {
+                actual: MAX_VIEWING_CIPHERTEXT_BYTES + 1,
+                maximum: MAX_VIEWING_CIPHERTEXT_BYTES,
+            })
+        );
+
+        let mut derived = viewing_aead_key(
+            VIEWING_PAYLOAD_VERSION,
+            VIEW_AEAD_KDF_DOMAIN,
+            &[43; 32],
+            &aad,
+        )
+        .unwrap();
+        let next_aad = ViewingKeyAad {
+            key_epoch: ViewingKeyEpoch::new(2),
+            ..aad
+        };
+        let next_derived = viewing_aead_key(
+            VIEWING_PAYLOAD_VERSION,
+            VIEW_AEAD_KDF_DOMAIN,
+            &[43; 32],
+            &next_aad,
+        )
+        .unwrap();
+        assert_ne!(*derived, *next_derived);
+        derived.zeroize();
+        assert_eq!(*derived, [0; 32]);
+    }
+
+    struct TestViewingKeyResolver {
+        current: ViewingKeyEpoch,
+        keys: BTreeMap<ViewingKeyEpoch, Hash>,
+    }
+
+    impl ViewingKeyResolver for TestViewingKeyResolver {
+        fn current_epoch(&self) -> Result<ViewingKeyEpoch> {
+            Ok(self.current)
+        }
+
+        fn key_for_epoch(&self, epoch: ViewingKeyEpoch) -> Result<Zeroizing<Hash>> {
+            self.keys
+                .get(&epoch)
+                .copied()
+                .map(Zeroizing::new)
+                .ok_or(ShieldedMarginError::ViewingKeyEpochUnavailable(epoch.0))
+        }
+    }
+
+    #[test]
+    fn viewing_key_resolver_supports_rotation_and_historical_recovery() {
+        let signing_key = SigningKey::from_bytes(&[35; 32]);
+        let opening = opening(&signing_key, 16, 2_000, 25, 4);
+        let epoch_one = ViewingKeyEpoch::new(1);
+        let epoch_two = epoch_one.next().unwrap();
+        let aad_one = viewing_aad(&opening, epoch_one.0);
+        let aad_two = viewing_aad(&opening, epoch_two.0);
+        let mut resolver = TestViewingKeyResolver {
+            current: epoch_one,
+            keys: BTreeMap::from([(epoch_one, [51; 32]), (epoch_two, [52; 32])]),
+        };
+        let cipher = XChaChaViewingKeyCipher;
+        let payload_one = cipher
+            .seal_with_resolver(&resolver, &aad_one, b"old epoch")
+            .unwrap();
+        resolver.current = epoch_two;
+        assert_eq!(
+            cipher
+                .open_with_resolver(&resolver, &aad_one, &payload_one)
+                .unwrap()
+                .as_slice(),
+            b"old epoch"
+        );
+        assert_eq!(
+            cipher
+                .seal_with_resolver(&resolver, &aad_one, b"stale")
+                .unwrap_err(),
+            ShieldedMarginError::ViewingKeyEpochMismatch
+        );
+        let payload_two = cipher
+            .seal_with_resolver(&resolver, &aad_two, b"new epoch")
+            .unwrap();
+        assert_eq!(
+            cipher
+                .open_with_resolver(&resolver, &aad_two, &payload_two)
+                .unwrap()
+                .as_slice(),
+            b"new epoch"
+        );
+        resolver.keys.remove(&epoch_one);
+        assert_eq!(
+            cipher
+                .open_with_resolver(&resolver, &aad_one, &payload_one)
+                .unwrap_err(),
+            ShieldedMarginError::ViewingKeyEpochUnavailable(epoch_one.0)
+        );
+        assert_eq!(epoch_two.next().unwrap().value(), 3);
+        assert_eq!(
+            ViewingKeyEpoch::new(u32::MAX).next(),
+            Err(ShieldedMarginError::ViewingKeyEpochOverflow)
         );
     }
 
