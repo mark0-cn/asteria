@@ -4,6 +4,7 @@ pub mod auth;
 pub mod batch_auction;
 pub mod chain_tx;
 pub mod consensus;
+pub mod dkg_ceremony;
 pub mod dkg_transport;
 pub mod domain;
 pub mod engine;
