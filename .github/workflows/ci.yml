@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (stable)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust components
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+
+      - name: Check formatting
+        shell: bash
+        run: cargo +stable fmt --all -- --check
+
+      - name: Check all targets and features
+        shell: bash
+        run: cargo +stable check --locked --all-features --all-targets
+
+      - name: Run all tests
+        shell: bash
+        run: cargo +stable test --locked --all-features --all-targets
+
+      - name: Run Clippy with warnings denied
+        shell: bash
+        run: cargo +stable clippy --locked --all-features --all-targets -- -D warnings
+
+  windows-scripts:
+    name: Windows PowerShell 5.1 scripts
+    runs-on: windows-2022
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Test backup and restore scripts
+        shell: powershell
+        run: .\deploy\comet\windows\Test-BackupRestore.ps1
+
+      - name: Test localnet scripts without runtime
+        shell: powershell
+        run: .\deploy\comet\windows\Test-LocalnetScripts.ps1
